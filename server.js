@@ -1370,6 +1370,20 @@ app.post("/api/login", async (req, res) => {
     return res.status(401).json({ ok: false, message: "Invalid email or password" });
   } catch (err) {
     console.error("Login error:", err);
+    const dbErrorCodes = new Set([
+      "ECONNREFUSED",
+      "ETIMEDOUT",
+      "ENOTFOUND",
+      "ER_ACCESS_DENIED_ERROR",
+      "ER_BAD_DB_ERROR",
+      "PROTOCOL_CONNECTION_LOST",
+    ]);
+    if (dbErrorCodes.has(err?.code)) {
+      return res.status(503).json({
+        ok: false,
+        message: "Database unavailable. Please contact admin.",
+      });
+    }
     return res.status(500).json({ ok: false, message: "Internal server error" });
   }
 });
