@@ -18,11 +18,16 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT || 5000);
 const HOST = process.env.HOST || "0.0.0.0";
+const DB_URL = String(process.env.DATABASE_URL || process.env.MYSQL_URL || "").trim();
 const DB_HOST = process.env.DB_HOST || "127.0.0.1";
 const DB_PORT = Number(process.env.DB_PORT || 3306);
 const DB_USER = process.env.DB_USER || "root";
 const DB_PASSWORD = process.env.DB_PASSWORD || "1234";
 const DB_NAME = process.env.DB_NAME || "courier_app";
+const DB_SSL = ["1", "true", "yes"].includes(String(process.env.DB_SSL || "").trim().toLowerCase());
+const DB_SSL_REJECT_UNAUTHORIZED = !["0", "false", "no"].includes(
+  String(process.env.DB_SSL_REJECT_UNAUTHORIZED || "").trim().toLowerCase()
+);
 const OTP_EXPIRY_MINUTES = Number(process.env.OTP_EXPIRY_MINUTES || 10);
 const OTP_RESEND_SECONDS = Number(process.env.OTP_RESEND_SECONDS || 30);
 const BCRYPT_SALT_ROUNDS = Number(process.env.BCRYPT_SALT_ROUNDS || 10);
@@ -59,16 +64,30 @@ if (IS_RENDER && (!process.env.DB_HOST || DB_HOST === "127.0.0.1" || DB_HOST ===
   );
 }
 
-const pool = mysql.createPool({
-  host: DB_HOST,
-  port: DB_PORT,
-  user: DB_USER,
-  password: DB_PASSWORD,
-  database: DB_NAME,
+const poolConfig = {
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-});
+};
+
+if (DB_SSL) {
+  poolConfig.ssl = { rejectUnauthorized: DB_SSL_REJECT_UNAUTHORIZED };
+}
+
+if (DB_URL) {
+  poolConfig.uri = DB_URL;
+  if (IS_RENDER) {
+    console.log("Using DATABASE_URL/MYSQL_URL for MySQL connection.");
+  }
+} else {
+  poolConfig.host = DB_HOST;
+  poolConfig.port = DB_PORT;
+  poolConfig.user = DB_USER;
+  poolConfig.password = DB_PASSWORD;
+  poolConfig.database = DB_NAME;
+}
+
+const pool = mysql.createPool(poolConfig);
 
 const otpStore = new Map();
 const verifiedEmails = new Map();
