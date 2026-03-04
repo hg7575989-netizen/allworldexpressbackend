@@ -51,6 +51,13 @@ const EMPLOYEE_IMAGE_MAX_BYTES = 100 * 1024;
 const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
 const PAN_REGEX = /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/;
 const CIN_REGEX = /^[A-Z]{1}[0-9]{5}[A-Z]{2}[0-9]{4}[A-Z]{3}[0-9]{6}$/;
+const IS_RENDER = String(process.env.RENDER || "").toLowerCase() === "true";
+
+if (IS_RENDER && (!process.env.DB_HOST || DB_HOST === "127.0.0.1" || DB_HOST === "localhost")) {
+  console.warn(
+    "DB_HOST is pointing to localhost on Render. Set external MySQL credentials in Render Environment variables."
+  );
+}
 
 const pool = mysql.createPool({
   host: DB_HOST,
