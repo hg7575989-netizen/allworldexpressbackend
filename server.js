@@ -2996,26 +2996,44 @@ app.post("/api/orders/scan", async (req, res) => {
         ? null
         : Number(longitudeRaw);
 
-    if (!docId || !awbNo) {
-      return res.status(400).json({ ok: false, message: "docId and awbNo are required" });
+    if (!awbNo) {
+      return res.status(400).json({ ok: false, message: "awbNo is required" });
     }
 
     if ((latitude !== null && Number.isNaN(latitude)) || (longitude !== null && Number.isNaN(longitude))) {
       return res.status(400).json({ ok: false, message: "Invalid latitude or longitude" });
     }
 
-    const [rows] = await pool.query(
-      `SELECT id, awb_no
-       FROM employee_docs
-       WHERE id = ? AND awb_no = ?
-       LIMIT 1`,
-      [docId, awbNo]
-    );
+    let rows = [];
+    if (docId) {
+      const [rowsByIdAndAwb] = await pool.query(
+        `SELECT id, awb_no
+         FROM employee_docs
+         WHERE id = ? AND awb_no = ?
+         LIMIT 1`,
+        [docId, awbNo]
+      );
+      rows = rowsByIdAndAwb;
+    }
+
+    if (!rows.length) {
+      const [rowsByAwb] = await pool.query(
+        `SELECT id, awb_no
+         FROM employee_docs
+         WHERE awb_no = ?
+         ORDER BY id DESC
+         LIMIT 1`,
+        [awbNo]
+      );
+      rows = rowsByAwb;
+    }
+
     if (!rows.length) {
       return res.status(404).json({ ok: false, message: "Order not found" });
     }
 
     const clientIp = readClientIp(req);
+    const matchedDocId = Number(rows[0].id);
     await pool.query(
       `UPDATE employee_docs
        SET order_status = 'in_transit',
@@ -3024,14 +3042,14 @@ app.post("/api/orders/scan", async (req, res) => {
            last_scan_ip = ?,
            last_scan_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [latitude, longitude, clientIp || null, docId]
+      [latitude, longitude, clientIp || null, matchedDocId]
     );
 
     return res.json({
       ok: true,
       message: "Order moved to in transit",
       order: {
-        id: docId,
+        id: matchedDocId,
         awb_no: awbNo,
         order_status: "in_transit",
         last_scan_latitude: latitude,
