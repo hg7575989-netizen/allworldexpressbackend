@@ -268,6 +268,10 @@ async function ensureEmployeeDocsTable() {
       awb_no VARCHAR(120) NOT NULL,
       form_type ENUM('Doct','Manifest') NOT NULL DEFAULT 'Doct',
       order_status ENUM('processing','manifest','in_transit','out_for_delivery','delivered') NOT NULL DEFAULT 'processing',
+      last_scan_latitude DECIMAL(10,7) NULL,
+      last_scan_longitude DECIMAL(10,7) NULL,
+      last_scan_ip VARCHAR(120) NULL,
+      last_scan_at DATETIME NULL,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       pdf_link TEXT NULL,
       form_data LONGTEXT NULL,
@@ -314,6 +318,22 @@ async function ensureEmployeeDocsTable() {
     [
       "order_status",
       "ALTER TABLE employee_docs ADD COLUMN order_status ENUM('processing','manifest','in_transit','out_for_delivery','delivered') NOT NULL DEFAULT 'processing' AFTER form_type",
+    ],
+    [
+      "last_scan_latitude",
+      "ALTER TABLE employee_docs ADD COLUMN last_scan_latitude DECIMAL(10,7) NULL AFTER order_status",
+    ],
+    [
+      "last_scan_longitude",
+      "ALTER TABLE employee_docs ADD COLUMN last_scan_longitude DECIMAL(10,7) NULL AFTER last_scan_latitude",
+    ],
+    [
+      "last_scan_ip",
+      "ALTER TABLE employee_docs ADD COLUMN last_scan_ip VARCHAR(120) NULL AFTER last_scan_longitude",
+    ],
+    [
+      "last_scan_at",
+      "ALTER TABLE employee_docs ADD COLUMN last_scan_at DATETIME NULL AFTER last_scan_ip",
     ],
   ];
   for (const [columnName, ddl] of employeeDocColumns) {
@@ -1386,6 +1406,14 @@ function normalizeOrderStatus(input, fallback = "processing") {
   return fallback;
 }
 
+function readClientIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").trim();
+  if (forwarded) {
+    return forwarded.split(",")[0].trim();
+  }
+  return String(req.socket?.remoteAddress || "").trim();
+}
+
 function isAdminAuthorized(req) {
   if (!ADMIN_PANEL_KEY) return true;
   const key = String(req.headers["x-admin-key"] || "").trim();
@@ -2447,6 +2475,7 @@ app.get("/api/admin/docs/daily", async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT d.id, d.employee_id, d.awb_no, d.form_type, d.created_at, d.pdf_link,
+              d.last_scan_latitude, d.last_scan_longitude, d.last_scan_ip, d.last_scan_at,
               d.generated_by_type,
               d.generated_by_company_id,
               d.generated_by_company_name,
@@ -2844,6 +2873,7 @@ app.get("/api/orders", async (_req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT d.id, d.employee_id, d.awb_no, d.form_type, d.order_status, d.created_at, d.pdf_link, d.form_data,
+              d.last_scan_latitude, d.last_scan_longitude, d.last_scan_ip, d.last_scan_at,
               d.generated_by_type, d.generated_by_company_id, d.generated_by_company_name, d.generated_by_admin_name,
               e.name AS generated_by_name,
               e.employee_id AS generated_by_employee_id,
@@ -2894,6 +2924,10 @@ app.get("/api/orders", async (_req, res) => {
         box_count: boxCount || "N/A",
         total_weight: totalWeight || "N/A",
         weight_summary: weightSummary || "N/A",
+        last_scan_latitude: row.last_scan_latitude,
+        last_scan_longitude: row.last_scan_longitude,
+        last_scan_ip: row.last_scan_ip || "",
+        last_scan_at: row.last_scan_at,
         generated_by_type: row.generated_by_type,
         generated_by_name:
           row.generated_by_type === "admin"
@@ -2909,6 +2943,105 @@ app.get("/api/orders", async (_req, res) => {
   } catch (err) {
     console.error("Fetch orders error:", err);
     return res.status(500).json({ ok: false, message: "Failed to fetch processing orders" });
+  }
+});
+
+app.post("/api/orders/mark-in-transit", async (req, res) => {
+  try {
+    const docId = Number(req.body?.docId || 0);
+    const awbNo = String(req.body?.awbNo || "").trim();
+
+    if (!docId || !awbNo) {
+      return res.status(400).json({ ok: false, message: "docId and awbNo are required" });
+    }
+
+    const [result] = await pool.query(
+      `UPDATE employee_docs
+       SET order_status = 'in_transit'
+       WHERE id = ? AND awb_no = ?`,
+      [docId, awbNo]
+    );
+
+    if (!result?.affectedRows) {
+      return res.status(404).json({ ok: false, message: "Order not found" });
+    }
+
+    return res.json({
+      ok: true,
+      message: "Order moved to in transit",
+      order: {
+        id: docId,
+        awb_no: awbNo,
+        order_status: "in_transit",
+      },
+    });
+  } catch (err) {
+    console.error("Mark in transit error:", err);
+    return res.status(500).json({ ok: false, message: "Failed to move order to in transit" });
+  }
+});
+
+app.post("/api/orders/scan", async (req, res) => {
+  try {
+    const docId = Number(req.body?.docId || 0);
+    const awbNo = String(req.body?.awbNo || "").trim();
+    const latitudeRaw = req.body?.latitude;
+    const longitudeRaw = req.body?.longitude;
+    const latitude =
+      latitudeRaw === undefined || latitudeRaw === null || latitudeRaw === ""
+        ? null
+        : Number(latitudeRaw);
+    const longitude =
+      longitudeRaw === undefined || longitudeRaw === null || longitudeRaw === ""
+        ? null
+        : Number(longitudeRaw);
+
+    if (!docId || !awbNo) {
+      return res.status(400).json({ ok: false, message: "docId and awbNo are required" });
+    }
+
+    if ((latitude !== null && Number.isNaN(latitude)) || (longitude !== null && Number.isNaN(longitude))) {
+      return res.status(400).json({ ok: false, message: "Invalid latitude or longitude" });
+    }
+
+    const [rows] = await pool.query(
+      `SELECT id, awb_no
+       FROM employee_docs
+       WHERE id = ? AND awb_no = ?
+       LIMIT 1`,
+      [docId, awbNo]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, message: "Order not found" });
+    }
+
+    const clientIp = readClientIp(req);
+    await pool.query(
+      `UPDATE employee_docs
+       SET order_status = 'in_transit',
+           last_scan_latitude = ?,
+           last_scan_longitude = ?,
+           last_scan_ip = ?,
+           last_scan_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [latitude, longitude, clientIp || null, docId]
+    );
+
+    return res.json({
+      ok: true,
+      message: "Order moved to in transit",
+      order: {
+        id: docId,
+        awb_no: awbNo,
+        order_status: "in_transit",
+        last_scan_latitude: latitude,
+        last_scan_longitude: longitude,
+        last_scan_ip: clientIp || "",
+      },
+    });
+  } catch (err) {
+    console.error("Order scan update error:", err);
+    return res.status(500).json({ ok: false, message: "Failed to update scanned order" });
   }
 });
 
