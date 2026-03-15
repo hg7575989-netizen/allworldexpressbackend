@@ -2950,6 +2950,7 @@ app.post("/api/orders/mark-in-transit", async (req, res) => {
   try {
     const docId = Number(req.body?.docId || 0);
     const awbNo = String(req.body?.awbNo || "").trim();
+    const normalizedAwb = awbNo.replace(/\s+/g, "").toUpperCase();
 
     if (!docId || !awbNo) {
       return res.status(400).json({ ok: false, message: "docId and awbNo are required" });
@@ -2958,8 +2959,8 @@ app.post("/api/orders/mark-in-transit", async (req, res) => {
     const [result] = await pool.query(
       `UPDATE employee_docs
        SET order_status = 'in_transit'
-       WHERE id = ? AND awb_no = ?`,
-      [docId, awbNo]
+       WHERE id = ? AND REPLACE(UPPER(TRIM(awb_no)), ' ', '') = ?`,
+      [docId, normalizedAwb]
     );
 
     if (!result?.affectedRows) {
@@ -2985,6 +2986,7 @@ app.post("/api/orders/scan", async (req, res) => {
   try {
     const docId = Number(req.body?.docId || 0);
     const awbNo = String(req.body?.awbNo || "").trim();
+    const normalizedAwb = awbNo.replace(/\s+/g, "").toUpperCase();
     const latitudeRaw = req.body?.latitude;
     const longitudeRaw = req.body?.longitude;
     const latitude =
@@ -3009,9 +3011,9 @@ app.post("/api/orders/scan", async (req, res) => {
       const [rowsByIdAndAwb] = await pool.query(
         `SELECT id, awb_no
          FROM employee_docs
-         WHERE id = ? AND awb_no = ?
+         WHERE id = ? AND REPLACE(UPPER(TRIM(awb_no)), ' ', '') = ?
          LIMIT 1`,
-        [docId, awbNo]
+        [docId, normalizedAwb]
       );
       rows = rowsByIdAndAwb;
     }
@@ -3020,10 +3022,10 @@ app.post("/api/orders/scan", async (req, res) => {
       const [rowsByAwb] = await pool.query(
         `SELECT id, awb_no
          FROM employee_docs
-         WHERE awb_no = ?
+         WHERE REPLACE(UPPER(TRIM(awb_no)), ' ', '') = ?
          ORDER BY id DESC
          LIMIT 1`,
-        [awbNo]
+        [normalizedAwb]
       );
       rows = rowsByAwb;
     }
