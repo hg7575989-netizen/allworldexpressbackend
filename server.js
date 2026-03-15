@@ -260,13 +260,20 @@ async function ensureEmployeeDocsTable() {
   const sql = `
     CREATE TABLE IF NOT EXISTS employee_docs (
       id INT AUTO_INCREMENT PRIMARY KEY,
-      employee_id INT NOT NULL,
+      employee_id INT NULL,
+      generated_by_type ENUM('employee','self','admin') NOT NULL DEFAULT 'employee',
+      generated_by_company_id INT NULL,
+      generated_by_company_name VARCHAR(200) NULL,
+      generated_by_admin_name VARCHAR(120) NULL,
       awb_no VARCHAR(120) NOT NULL,
       form_type ENUM('Doct','Manifest') NOT NULL DEFAULT 'Doct',
+      order_status ENUM('processing','manifest','in_transit','out_for_delivery','delivered') NOT NULL DEFAULT 'processing',
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       pdf_link TEXT NULL,
       form_data LONGTEXT NULL,
       KEY idx_employee_docs_employee_id (employee_id),
+      KEY idx_employee_docs_generated_by_company_id (generated_by_company_id),
+      KEY idx_employee_docs_order_status (order_status),
       CONSTRAINT fk_employee_docs_employee
         FOREIGN KEY (employee_id) REFERENCES employee(id)
         ON DELETE CASCADE
@@ -275,6 +282,92 @@ async function ensureEmployeeDocsTable() {
   `;
 
   await pool.query(sql);
+
+  const [employeeIdNullability] = await pool.query(
+    `SELECT IS_NULLABLE
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'employee_docs' AND COLUMN_NAME = 'employee_id'
+     LIMIT 1`,
+    [DB_NAME]
+  );
+  if (employeeIdNullability.length && String(employeeIdNullability[0].IS_NULLABLE || "").toUpperCase() !== "YES") {
+    await pool.query("ALTER TABLE employee_docs MODIFY COLUMN employee_id INT NULL");
+  }
+
+  const employeeDocColumns = [
+    [
+      "generated_by_type",
+      "ALTER TABLE employee_docs ADD COLUMN generated_by_type ENUM('employee','self','admin') NOT NULL DEFAULT 'employee' AFTER employee_id",
+    ],
+    [
+      "generated_by_company_id",
+      "ALTER TABLE employee_docs ADD COLUMN generated_by_company_id INT NULL AFTER generated_by_type",
+    ],
+    [
+      "generated_by_company_name",
+      "ALTER TABLE employee_docs ADD COLUMN generated_by_company_name VARCHAR(200) NULL AFTER generated_by_company_id",
+    ],
+    [
+      "generated_by_admin_name",
+      "ALTER TABLE employee_docs ADD COLUMN generated_by_admin_name VARCHAR(120) NULL AFTER generated_by_company_name",
+    ],
+    [
+      "order_status",
+      "ALTER TABLE employee_docs ADD COLUMN order_status ENUM('processing','manifest','in_transit','out_for_delivery','delivered') NOT NULL DEFAULT 'processing' AFTER form_type",
+    ],
+  ];
+  for (const [columnName, ddl] of employeeDocColumns) {
+    const [exists] = await pool.query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'employee_docs' AND COLUMN_NAME = ?
+       LIMIT 1`,
+      [DB_NAME, columnName]
+    );
+    if (!exists.length) {
+      await pool.query(ddl);
+    }
+  }
+
+  const [generatedByTypeColumn] = await pool.query(
+    `SELECT COLUMN_TYPE
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'employee_docs' AND COLUMN_NAME = 'generated_by_type'
+     LIMIT 1`,
+    [DB_NAME]
+  );
+  if (
+    generatedByTypeColumn.length &&
+    !String(generatedByTypeColumn[0].COLUMN_TYPE || "").toLowerCase().includes("'admin'")
+  ) {
+    await pool.query(
+      "ALTER TABLE employee_docs MODIFY COLUMN generated_by_type ENUM('employee','self','admin') NOT NULL DEFAULT 'employee'"
+    );
+  }
+
+  const [companyGenIndex] = await pool.query(
+    `SELECT INDEX_NAME
+     FROM INFORMATION_SCHEMA.STATISTICS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'employee_docs' AND INDEX_NAME = 'idx_employee_docs_generated_by_company_id'
+     LIMIT 1`,
+    [DB_NAME]
+  );
+  if (!companyGenIndex.length) {
+    await pool.query(
+      "CREATE INDEX idx_employee_docs_generated_by_company_id ON employee_docs (generated_by_company_id)"
+    );
+  }
+
+  const [orderStatusIndex] = await pool.query(
+    `SELECT INDEX_NAME
+     FROM INFORMATION_SCHEMA.STATISTICS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'employee_docs' AND INDEX_NAME = 'idx_employee_docs_order_status'
+     LIMIT 1`,
+    [DB_NAME]
+  );
+  if (!orderStatusIndex.length) {
+    await pool.query("CREATE INDEX idx_employee_docs_order_status ON employee_docs (order_status)");
+  }
 
   // Backward compatibility if older table name exists.
   const [legacyTable] = await pool.query(
@@ -287,8 +380,10 @@ async function ensureEmployeeDocsTable() {
 
   if (legacyTable.length) {
     await pool.query(
-      `INSERT INTO employee_docs (employee_id, awb_no, form_type, created_at, pdf_link)
-       SELECT d.employee_id, d.awb_no, d.form_type, d.created_at, d.pdf_link
+      `INSERT INTO employee_docs (employee_id, awb_no, form_type, order_status, created_at, pdf_link, generated_by_type)
+       SELECT d.employee_id, d.awb_no, d.form_type,
+              CASE WHEN d.form_type = 'Manifest' THEN 'manifest' ELSE 'processing' END,
+              d.created_at, d.pdf_link, 'employee'
        FROM employee_doct d
        LEFT JOIN employee_docs n
          ON n.employee_id = d.employee_id
@@ -1182,14 +1277,15 @@ app.post("/api/drive/upload", upload.single("file"), async (req, res) => {
       err?.message ||
       "Failed to upload PDF to Google Drive";
 
+    if (/invalid_grant/i.test(providerMessage)) {
+      return res.status(500).json({
+        ok: false,
+        message:
+          "Google OAuth refresh token invalid ya expired hai. GOOGLE_OAUTH_REFRESH_TOKEN dobara generate karein.",
+      });
+    }
+
     if (status === 401) {
-      if (/invalid_grant/i.test(providerMessage)) {
-        return res.status(500).json({
-          ok: false,
-          message:
-            "Google OAuth refresh token is invalid/expired. Re-generate GOOGLE_OAUTH_REFRESH_TOKEN.",
-        });
-      }
       return res.status(500).json({
         ok: false,
         message:
@@ -1276,6 +1372,18 @@ function parseOptionalBoolean(value) {
   if (raw === "1" || raw === "true" || raw === "yes") return true;
   if (raw === "0" || raw === "false" || raw === "no") return false;
   return null;
+}
+
+function normalizeOrderStatus(input, fallback = "processing") {
+  const raw = String(input || "").trim().toLowerCase();
+  if (!raw) return fallback;
+
+  if (raw === "processing") return "processing";
+  if (raw === "manifest" || raw === "manifested") return "manifest";
+  if (raw === "in_transit" || raw === "in transit") return "in_transit";
+  if (raw === "out_for_delivery" || raw === "out for delivery") return "out_for_delivery";
+  if (raw === "delivered") return "delivered";
+  return fallback;
 }
 
 function isAdminAuthorized(req) {
@@ -2185,6 +2293,7 @@ app.get("/api/admin/overview", async (req, res) => {
 
     const [allDocsRows] = await pool.query(
       `SELECT d.id, d.employee_id, d.awb_no, d.form_type, d.created_at, d.pdf_link,
+              d.generated_by_type, d.generated_by_company_id, d.generated_by_company_name,
               e.name AS generated_by_name,
               e.employee_id AS generated_by_employee_id,
               COALESCE(
@@ -2338,20 +2447,39 @@ app.get("/api/admin/docs/daily", async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT d.id, d.employee_id, d.awb_no, d.form_type, d.created_at, d.pdf_link,
-              e.name AS generated_by_name,
-              e.employee_id AS generated_by_employee_id
+              d.generated_by_type,
+              d.generated_by_company_id,
+              d.generated_by_company_name,
+              d.generated_by_admin_name,
+              CASE
+                WHEN d.generated_by_type = 'self' THEN CONCAT('Self (', COALESCE(d.generated_by_company_name, 'Company'), ')')
+                WHEN d.generated_by_type = 'admin' THEN CONCAT('Generated by Admin (', COALESCE(d.generated_by_admin_name, ?), ')')
+                ELSE e.name
+              END AS generated_by_name,
+              CASE
+                WHEN d.generated_by_type = 'self' THEN CONCAT('Generated on ', DATE_FORMAT(d.created_at, '%Y-%m-%d %H:%i:%s'))
+                WHEN d.generated_by_type = 'admin' THEN DATE_FORMAT(d.created_at, '%Y-%m-%d %H:%i:%s')
+                ELSE e.employee_id
+              END AS generated_by_employee_id
        FROM employee_docs d
        LEFT JOIN employee e ON e.id = d.employee_id
        WHERE d.form_type = 'Doct' AND DATE(d.created_at) = ?
        ORDER BY d.created_at DESC, d.id DESC`,
-      [targetDate]
+      [ADMIN_NAME, targetDate]
     );
 
     const docs = rows.map((row) => ({
       ...row,
-      edit_url: `/doct?docId=${encodeURIComponent(row.id)}&employeeId=${encodeURIComponent(
-        row.employee_id
-      )}&admin=1`,
+      edit_url:
+        String(row.generated_by_type || "").toLowerCase() === "self"
+          ? `/doct?docId=${encodeURIComponent(row.id)}&companyId=${encodeURIComponent(
+              row.generated_by_company_id || ""
+            )}&admin=1`
+          : String(row.generated_by_type || "").toLowerCase() === "admin"
+            ? `/doct?docId=${encodeURIComponent(row.id)}&generatedBy=admin&admin=1`
+          : `/doct?docId=${encodeURIComponent(row.id)}&employeeId=${encodeURIComponent(
+              row.employee_id
+            )}&admin=1`,
     }));
 
     return res.json({
@@ -2371,13 +2499,41 @@ app.post("/api/docs/next-awb", async (req, res) => {
     const formType = req.body?.formType === "Manifest" ? "Manifest" : "Doct";
     const consignor = String(req.body?.consignor || "").trim();
     const employeeIdInput = req.body?.employeeId;
+    const companyIdInput = req.body?.companyId;
+    const accountType = String(req.body?.accountType || "").trim().toLowerCase();
 
     if (!consignor) {
       return res.status(400).json({ ok: false, message: "consignor is required" });
     }
 
     let employeeDbId = null;
-    if (employeeIdInput !== undefined && employeeIdInput !== null && String(employeeIdInput).trim()) {
+    const companyDbId = await resolveCompanyDbId(companyIdInput);
+    const isAdminFlow = accountType === "admin";
+    const isCompanySelfFlow = accountType === "company" || (!!companyDbId && !employeeIdInput);
+
+    if (isCompanySelfFlow) {
+      if (!companyDbId) {
+        return res.status(400).json({ ok: false, message: "Invalid company id" });
+      }
+
+      const [companyRows] = await pool.query(
+        "SELECT company_name FROM company WHERE id = ? LIMIT 1",
+        [companyDbId]
+      );
+      if (!companyRows.length) {
+        return res.status(404).json({ ok: false, message: "Company not found" });
+      }
+
+      const companyName = String(companyRows[0].company_name || "").trim();
+      if (companyName && consignor.toLowerCase() !== companyName.toLowerCase()) {
+        return res.status(400).json({
+          ok: false,
+          message: "Company account can generate DOCT only for its own consignor name",
+        });
+      }
+    }
+
+    if (!isAdminFlow && employeeIdInput !== undefined && employeeIdInput !== null && String(employeeIdInput).trim()) {
       employeeDbId = await resolveEmployeeDbId(employeeIdInput);
       if (!employeeDbId) {
         return res.status(400).json({ ok: false, message: "Invalid employee id" });
@@ -2403,17 +2559,58 @@ app.post("/api/docs/next-awb", async (req, res) => {
 
 app.post("/api/docs", async (req, res) => {
   try {
-    const employeeDbId = await resolveEmployeeDbId(req.body?.employeeId);
+    const employeeIdInput = req.body?.employeeId;
+    const companyIdInput = req.body?.companyId;
+    const accountType = String(req.body?.accountType || "").trim().toLowerCase();
+    const employeeDbId = await resolveEmployeeDbId(employeeIdInput);
+    const companyDbId = await resolveCompanyDbId(companyIdInput);
     const docId = Number(req.body?.docId || 0);
     const awbNo = String(req.body?.awbNo || "").trim();
     const formType = req.body?.formType === "Manifest" ? "Manifest" : "Doct";
+    const inferredDefaultStatus = formType === "Manifest" ? "manifest" : "processing";
+    const orderStatus = normalizeOrderStatus(req.body?.orderStatus, inferredDefaultStatus);
     const pdfLink = req.body?.pdfLink ? String(req.body.pdfLink) : null;
     const rawFormData =
       req.body?.formData && typeof req.body.formData === "object" ? req.body.formData : null;
     const consignorName = String(rawFormData?.form?.consignor || "").trim() || null;
     const formData = rawFormData ? JSON.stringify(rawFormData) : null;
+    const isAdminFlow = accountType === "admin";
+    const isCompanySelfFlow = accountType === "company" || (!!companyDbId && !employeeDbId);
 
-    if (!employeeDbId) {
+    let generatedByType = "employee";
+    let generatedByCompanyId = null;
+    let generatedByCompanyName = null;
+    let generatedByAdminName = null;
+
+    if (isAdminFlow) {
+      generatedByType = "admin";
+      generatedByAdminName = ADMIN_NAME;
+    } else if (isCompanySelfFlow) {
+      if (!companyDbId) {
+        return res.status(400).json({ ok: false, message: "Invalid company id" });
+      }
+      const [companyRows] = await pool.query(
+        "SELECT company_name FROM company WHERE id = ? LIMIT 1",
+        [companyDbId]
+      );
+      if (!companyRows.length) {
+        return res.status(404).json({ ok: false, message: "Company not found" });
+      }
+      generatedByType = "self";
+      generatedByCompanyId = companyDbId;
+      generatedByCompanyName = String(companyRows[0].company_name || "").trim() || null;
+
+      if (
+        consignorName &&
+        generatedByCompanyName &&
+        consignorName.toLowerCase() !== generatedByCompanyName.toLowerCase()
+      ) {
+        return res.status(400).json({
+          ok: false,
+          message: "Company account can generate DOCT only for its own consignor name",
+        });
+      }
+    } else if (!employeeDbId) {
       return res.status(400).json({ ok: false, message: "Invalid employee id" });
     }
 
@@ -2422,12 +2619,49 @@ app.post("/api/docs", async (req, res) => {
     }
 
     if (docId > 0) {
-      await pool.query(
-        `UPDATE employee_docs
-         SET awb_no = ?, form_type = ?, pdf_link = ?, form_data = ?
-         WHERE id = ? AND employee_id = ?`,
-        [awbNo, formType, pdfLink, formData, docId, employeeDbId]
-      );
+      let updateResult;
+      if (generatedByType === "self") {
+        [updateResult] = await pool.query(
+          `UPDATE employee_docs
+           SET employee_id = NULL, generated_by_type = 'self', generated_by_company_id = ?,
+               generated_by_company_name = ?, generated_by_admin_name = NULL,
+               awb_no = ?, form_type = ?, order_status = ?, pdf_link = ?, form_data = ?
+           WHERE id = ? AND generated_by_type = 'self' AND generated_by_company_id = ?`,
+          [
+            generatedByCompanyId,
+            generatedByCompanyName,
+            awbNo,
+            formType,
+            orderStatus,
+            pdfLink,
+            formData,
+            docId,
+            generatedByCompanyId,
+          ]
+        );
+      } else if (generatedByType === "admin") {
+        [updateResult] = await pool.query(
+          `UPDATE employee_docs
+           SET employee_id = NULL, generated_by_type = 'admin', generated_by_company_id = NULL,
+               generated_by_company_name = NULL, generated_by_admin_name = ?, awb_no = ?, form_type = ?,
+               order_status = ?, pdf_link = ?, form_data = ?
+           WHERE id = ? AND generated_by_type = 'admin'`,
+          [generatedByAdminName, awbNo, formType, orderStatus, pdfLink, formData, docId]
+        );
+      } else {
+        [updateResult] = await pool.query(
+          `UPDATE employee_docs
+           SET employee_id = ?, generated_by_type = 'employee', generated_by_company_id = NULL,
+               generated_by_company_name = NULL, generated_by_admin_name = NULL,
+               awb_no = ?, form_type = ?, order_status = ?, pdf_link = ?, form_data = ?
+           WHERE id = ? AND employee_id = ?`,
+          [employeeDbId, awbNo, formType, orderStatus, pdfLink, formData, docId, employeeDbId]
+        );
+      }
+
+      if (!updateResult?.affectedRows) {
+        return res.status(404).json({ ok: false, message: "Document not found" });
+      }
 
       if (pdfLink) {
         await pool.query(
@@ -2446,17 +2680,36 @@ app.post("/api/docs", async (req, res) => {
         doc: {
           id: docId,
           employee_id: employeeDbId,
+          generated_by_type: generatedByType,
+          generated_by_company_id: generatedByCompanyId,
+          generated_by_company_name: generatedByCompanyName,
+          generated_by_admin_name: generatedByAdminName,
           awb_no: awbNo,
           form_type: formType,
+          order_status: orderStatus,
           pdf_link: pdfLink,
         },
       });
     }
 
     const [result] = await pool.query(
-      `INSERT INTO employee_docs (employee_id, awb_no, form_type, pdf_link, form_data)
-       VALUES (?, ?, ?, ?, ?)`,
-      [employeeDbId, awbNo, formType, pdfLink, formData]
+      `INSERT INTO employee_docs (
+         employee_id, generated_by_type, generated_by_company_id, generated_by_company_name,
+         generated_by_admin_name, awb_no, form_type, order_status, pdf_link, form_data
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        generatedByType === "employee" ? employeeDbId : null,
+        generatedByType,
+        generatedByCompanyId,
+        generatedByCompanyName,
+        generatedByAdminName,
+        awbNo,
+        formType,
+        orderStatus,
+        pdfLink,
+        formData,
+      ]
     );
 
     if (pdfLink) {
@@ -2476,8 +2729,13 @@ app.post("/api/docs", async (req, res) => {
       doc: {
         id: result.insertId,
         employee_id: employeeDbId,
+        generated_by_type: generatedByType,
+        generated_by_company_id: generatedByCompanyId,
+        generated_by_company_name: generatedByCompanyName,
+        generated_by_admin_name: generatedByAdminName,
         awb_no: awbNo,
         form_type: formType,
+        order_status: orderStatus,
         pdf_link: pdfLink,
       },
     });
@@ -2535,10 +2793,30 @@ app.get("/api/company/docs", async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT d.id, d.employee_id, d.awb_no, d.form_type, d.created_at, d.pdf_link,
+              d.generated_by_type,
+              d.generated_by_company_id,
+              d.generated_by_company_name,
+              d.generated_by_admin_name,
               e.name AS generated_by_name,
               e.employee_id AS generated_by_employee_id,
               ab.consignor_name,
-              'employee' AS generated_by_type
+              CASE
+                WHEN d.generated_by_type = 'self' THEN CONCAT(
+                  'Self (',
+                  COALESCE(d.generated_by_company_name, 'Company'),
+                  ' | ',
+                  DATE_FORMAT(d.created_at, '%Y-%m-%d %H:%i:%s'),
+                  ')'
+                )
+                WHEN d.generated_by_type = 'admin' THEN CONCAT(
+                  'Generated by Admin (',
+                  COALESCE(d.generated_by_admin_name, ?),
+                  ' | ',
+                  DATE_FORMAT(d.created_at, '%Y-%m-%d %H:%i:%s'),
+                  ')'
+                )
+                ELSE NULL
+              END AS generated_by_detail
        FROM employee_docs d
        LEFT JOIN employee e ON e.id = d.employee_id
        LEFT JOIN airwaybills ab ON ab.awb_number = d.awb_no
@@ -2552,7 +2830,7 @@ app.get("/api/company/docs", async (req, res) => {
        ))) = LOWER(TRIM(?))
        ORDER BY d.created_at DESC, d.id DESC`
       ,
-      [companyName]
+      [ADMIN_NAME, companyName]
     );
 
     return res.json({ ok: true, docs: rows });
@@ -2562,21 +2840,120 @@ app.get("/api/company/docs", async (req, res) => {
   }
 });
 
+app.get("/api/orders", async (_req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT d.id, d.employee_id, d.awb_no, d.form_type, d.order_status, d.created_at, d.pdf_link, d.form_data,
+              d.generated_by_type, d.generated_by_company_id, d.generated_by_company_name, d.generated_by_admin_name,
+              e.name AS generated_by_name,
+              e.employee_id AS generated_by_employee_id,
+              ab.consignor_name
+       FROM employee_docs d
+       LEFT JOIN employee e ON e.id = d.employee_id
+       LEFT JOIN airwaybills ab ON ab.awb_number = d.awb_no
+       ORDER BY d.created_at DESC, d.id DESC`
+    );
+
+    const docs = rows.map((row) => {
+      let parsedFormData = null;
+      if (row.form_data) {
+        try {
+          parsedFormData = JSON.parse(row.form_data);
+        } catch {
+          parsedFormData = null;
+        }
+      }
+
+      const form = parsedFormData?.form && typeof parsedFormData.form === "object" ? parsedFormData.form : {};
+      const status = normalizeOrderStatus(
+        row.order_status,
+        row.form_type === "Manifest" ? "manifest" : "processing"
+      );
+      const boxCount = String(form.noOfBox || "").trim();
+      const totalWeight = String(form.totalWeight || "").trim();
+      const weightSummary = [boxCount ? `${boxCount} Box` : "", totalWeight ? `${totalWeight} Kg` : ""]
+        .filter(Boolean)
+        .join(" • ");
+
+      return {
+        id: row.id,
+        awb_no: row.awb_no,
+        form_type: row.form_type,
+        order_status: status,
+        created_at: row.created_at,
+        pdf_link: row.pdf_link,
+        customer_name: String(form.consignee || "").trim() || "N/A",
+        customer_phone: String(form.mobileNumber || "").trim() || "",
+        consignor_name: String(form.consignor || row.consignor_name || "").trim() || "N/A",
+        origin: String(form.origin || "").trim(),
+        destination: String(form.destination || "").trim(),
+        payment_label: "Prepaid",
+        service_type: "B2C",
+        order_reference: row.awb_no ? `#${row.awb_no}` : `#${row.id}`,
+        order_category: String(form.contentDescription || "").trim() || "General",
+        box_count: boxCount || "N/A",
+        total_weight: totalWeight || "N/A",
+        weight_summary: weightSummary || "N/A",
+        generated_by_type: row.generated_by_type,
+        generated_by_name:
+          row.generated_by_type === "admin"
+            ? row.generated_by_admin_name || ADMIN_NAME
+            : row.generated_by_name || row.generated_by_company_name || "Self",
+        generated_by_employee_id: row.generated_by_employee_id || "",
+        generated_by_company_name: row.generated_by_company_name || "",
+        generated_by_admin_name: row.generated_by_admin_name || "",
+      };
+    });
+
+    return res.json({ ok: true, docs });
+  } catch (err) {
+    console.error("Fetch orders error:", err);
+    return res.status(500).json({ ok: false, message: "Failed to fetch processing orders" });
+  }
+});
+
 app.get("/api/docs/:id", async (req, res) => {
   try {
     const employeeDbId = await resolveEmployeeDbId(req.query?.employeeId);
+    const companyDbId = await resolveCompanyDbId(req.query?.companyId);
+    const isAdminDoc = String(req.query?.accountType || req.query?.generatedBy || "").trim().toLowerCase() === "admin";
     const docId = Number(req.params?.id || 0);
-    if (!employeeDbId || !docId) {
-      return res.status(400).json({ ok: false, message: "Invalid employee id or doc id" });
+    if (!docId) {
+      return res.status(400).json({ ok: false, message: "Invalid doc id" });
+    }
+    if (!employeeDbId && !companyDbId && !isAdminDoc) {
+      return res.status(400).json({ ok: false, message: "Invalid employee/company/admin id" });
     }
 
-    const [rows] = await pool.query(
-      `SELECT id, employee_id, awb_no, form_type, created_at, pdf_link, form_data
-       FROM employee_docs
-       WHERE id = ? AND employee_id = ?
-       LIMIT 1`,
-      [docId, employeeDbId]
-    );
+    let rows;
+    if (employeeDbId) {
+      [rows] = await pool.query(
+        `SELECT id, employee_id, generated_by_type, generated_by_company_id, generated_by_company_name, generated_by_admin_name,
+                awb_no, form_type, created_at, pdf_link, form_data
+         FROM employee_docs
+         WHERE id = ? AND employee_id = ?
+         LIMIT 1`,
+        [docId, employeeDbId]
+      );
+    } else if (isAdminDoc) {
+      [rows] = await pool.query(
+        `SELECT id, employee_id, generated_by_type, generated_by_company_id, generated_by_company_name, generated_by_admin_name,
+                awb_no, form_type, created_at, pdf_link, form_data
+         FROM employee_docs
+         WHERE id = ? AND generated_by_type = 'admin'
+         LIMIT 1`,
+        [docId]
+      );
+    } else {
+      [rows] = await pool.query(
+        `SELECT id, employee_id, generated_by_type, generated_by_company_id, generated_by_company_name, generated_by_admin_name,
+                awb_no, form_type, created_at, pdf_link, form_data
+         FROM employee_docs
+         WHERE id = ? AND generated_by_type = 'self' AND generated_by_company_id = ?
+         LIMIT 1`,
+        [docId, companyDbId]
+      );
+    }
 
     if (!rows.length) {
       return res.status(404).json({ ok: false, message: "Document not found" });
