@@ -37,6 +37,8 @@ const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_USER = process.env.SMTP_USER || "";
 const SMTP_PASS = String(process.env.SMTP_PASS || "").replace(/\s+/g, "");
 const OTP_FROM_EMAIL = process.env.OTP_FROM_EMAIL || SMTP_USER;
+const OTP_FROM_NAME = String(process.env.OTP_FROM_NAME || "AllWorld Express").trim();
+const BREVO_API_KEY = String(process.env.BREVO_API_KEY || "").trim();
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "admin@allworldexpress.com").trim().toLowerCase();
 const ADMIN_NAME = String(process.env.ADMIN_NAME || "Admin").trim() || "Admin";
 const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || "admin12345");
@@ -105,6 +107,64 @@ const transporter =
         auth: { user: SMTP_USER, pass: SMTP_PASS },
       })
     : null;
+
+async function sendOtpEmail({ to, otp }) {
+  const subject = "Your Signup OTP";
+  const text = `Your OTP is ${otp}. It will expire in ${OTP_EXPIRY_MINUTES} minutes.`;
+  const html = `<p>Your OTP is <b>${otp}</b>.</p><p>It will expire in ${OTP_EXPIRY_MINUTES} minutes.</p>`;
+
+  if (BREVO_API_KEY) {
+    if (!OTP_FROM_EMAIL) {
+      const err = new Error("Brevo sender email is missing");
+      err.code = "BREVO_SENDER_MISSING";
+      throw err;
+    }
+
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "api-key": BREVO_API_KEY,
+      },
+      body: JSON.stringify({
+        sender: {
+          name: OTP_FROM_NAME,
+          email: OTP_FROM_EMAIL,
+        },
+        to: [{ email: to }],
+        subject,
+        textContent: text,
+        htmlContent: html,
+      }),
+    });
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      const err = new Error(data?.message || "Brevo email send failed");
+      err.code = response.status === 401 || response.status === 403 ? "BREVO_AUTH" : "BREVO_SEND";
+      err.status = response.status;
+      err.providerMessage = data?.message || "";
+      throw err;
+    }
+
+    return;
+  }
+
+  if (!transporter) {
+    const err = new Error("SMTP is not configured");
+    err.code = "EMAIL_NOT_CONFIGURED";
+    throw err;
+  }
+
+  await transporter.sendMail({
+    from: OTP_FROM_EMAIL,
+    to,
+    subject,
+    text,
+    html,
+  });
+}
 
 async function ensureEmployeeTable() {
   const sql = `
@@ -1675,21 +1735,15 @@ app.post("/api/signup/send-otp", async (req, res) => {
     const otp = String(Math.floor(100000 + Math.random() * 900000));
     const expiresAt = now + OTP_EXPIRY_MINUTES * 60 * 1000;
 
-    if (!transporter) {
+    if (!BREVO_API_KEY && !transporter) {
       return res.status(500).json({
         ok: false,
         message:
-          "SMTP is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, OTP_FROM_EMAIL in backend env.",
+          "Email sending is not configured. Set BREVO_API_KEY and OTP_FROM_EMAIL, or configure SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS.",
       });
     }
 
-    await transporter.sendMail({
-      from: OTP_FROM_EMAIL,
-      to: cleanEmail,
-      subject: "Your Signup OTP",
-      text: `Your OTP is ${otp}. It will expire in ${OTP_EXPIRY_MINUTES} minutes.`,
-      html: `<p>Your OTP is <b>${otp}</b>.</p><p>It will expire in ${OTP_EXPIRY_MINUTES} minutes.</p>`,
-    });
+    await sendOtpEmail({ to: cleanEmail, otp });
 
     otpStore.set(cleanEmail, { otp, expiresAt, sentAt: now });
     verifiedEmails.delete(cleanEmail);
@@ -1705,10 +1759,33 @@ app.post("/api/signup/send-otp", async (req, res) => {
       });
     }
 
+    if (err?.code === "BREVO_AUTH") {
+      return res.status(500).json({
+        ok: false,
+        message: "Brevo auth failed. Check BREVO_API_KEY and verified sender email.",
+      });
+    }
+
+    if (err?.code === "BREVO_SENDER_MISSING") {
+      return res.status(500).json({
+        ok: false,
+        message: "Brevo sender email missing. Set OTP_FROM_EMAIL to your verified sender email.",
+      });
+    }
+
+    if (err?.code === "BREVO_SEND") {
+      return res.status(500).json({
+        ok: false,
+        message: err.providerMessage || "Brevo email send failed. Verify sender/domain in Brevo.",
+      });
+    }
+
     if (err?.code === "ESOCKET" || err?.code === "ETIMEDOUT") {
       return res.status(500).json({
         ok: false,
-        message: "SMTP connection failed. Check SMTP_HOST/SMTP_PORT and internet connection.",
+        message: IS_RENDER
+          ? "SMTP connection failed. Render free service par SMTP ports (25/465/587) blocked ho sakte hain. Paid instance use karein ya email provider/API (Brevo/Resend/SendGrid) par switch karein."
+          : "SMTP connection failed. Check SMTP_HOST/SMTP_PORT and internet connection.",
       });
     }
 
