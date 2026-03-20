@@ -328,6 +328,11 @@ async function ensureEmployeeDocsTable() {
       awb_no VARCHAR(120) NOT NULL,
       form_type ENUM('Doct','Manifest') NOT NULL DEFAULT 'Doct',
       order_status ENUM('processing','manifest','in_transit','out_for_delivery','delivered') NOT NULL DEFAULT 'processing',
+      manifest_number VARCHAR(20) NULL,
+      manifest_to_name VARCHAR(200) NULL,
+      manifest_destination VARCHAR(200) NULL,
+      manifest_date DATE NULL,
+      manifest_through VARCHAR(200) NULL,
       last_scan_latitude DECIMAL(10,7) NULL,
       last_scan_longitude DECIMAL(10,7) NULL,
       last_scan_ip VARCHAR(120) NULL,
@@ -380,8 +385,28 @@ async function ensureEmployeeDocsTable() {
       "ALTER TABLE employee_docs ADD COLUMN order_status ENUM('processing','manifest','in_transit','out_for_delivery','delivered') NOT NULL DEFAULT 'processing' AFTER form_type",
     ],
     [
+      "manifest_number",
+      "ALTER TABLE employee_docs ADD COLUMN manifest_number VARCHAR(20) NULL AFTER order_status",
+    ],
+    [
+      "manifest_to_name",
+      "ALTER TABLE employee_docs ADD COLUMN manifest_to_name VARCHAR(200) NULL AFTER manifest_number",
+    ],
+    [
+      "manifest_destination",
+      "ALTER TABLE employee_docs ADD COLUMN manifest_destination VARCHAR(200) NULL AFTER manifest_to_name",
+    ],
+    [
+      "manifest_date",
+      "ALTER TABLE employee_docs ADD COLUMN manifest_date DATE NULL AFTER manifest_destination",
+    ],
+    [
+      "manifest_through",
+      "ALTER TABLE employee_docs ADD COLUMN manifest_through VARCHAR(200) NULL AFTER manifest_date",
+    ],
+    [
       "last_scan_latitude",
-      "ALTER TABLE employee_docs ADD COLUMN last_scan_latitude DECIMAL(10,7) NULL AFTER order_status",
+      "ALTER TABLE employee_docs ADD COLUMN last_scan_latitude DECIMAL(10,7) NULL AFTER manifest_through",
     ],
     [
       "last_scan_longitude",
@@ -635,6 +660,10 @@ function formatAwbNo(consignorCode, sequenceNo) {
   return `AWE-${consignorCode}-${nextSerial}`;
 }
 
+function formatManifestNumber(sequenceNo) {
+  return String(sequenceNo).padStart(4, "0");
+}
+
 async function allocateNextAwb({ formType, consignor, employeeDbId }) {
   const safeFormType = formType === "Manifest" ? "Manifest" : "Doct";
   const cleanConsignor = String(consignor || "").trim();
@@ -665,6 +694,25 @@ async function allocateNextAwb({ formType, consignor, employeeDbId }) {
     consignorCode,
     formType: safeFormType,
     employeeDbId: employeeDbId || null,
+  };
+}
+
+async function allocateNextManifestNumber() {
+  const [rows] = await pool.query(
+    `SELECT manifest_number
+     FROM employee_docs
+     WHERE manifest_number IS NOT NULL AND manifest_number <> ''
+     ORDER BY CAST(manifest_number AS UNSIGNED) DESC, id DESC
+     LIMIT 1`
+  );
+
+  const lastManifestNumber = rows.length ? String(rows[0].manifest_number || "").trim() : "";
+  const lastSequence = /^\d+$/.test(lastManifestNumber) ? Number(lastManifestNumber) : 0;
+  const nextSequence = lastSequence + 1;
+
+  return {
+    manifestNumber: formatManifestNumber(nextSequence),
+    sequenceNo: nextSequence,
   };
 }
 
@@ -2663,6 +2711,262 @@ app.post("/api/docs/next-awb", async (req, res) => {
   }
 });
 
+app.get("/api/manifests/next-number", async (_req, res) => {
+  try {
+    const allocated = await allocateNextManifestNumber();
+    return res.json({
+      ok: true,
+      message: "Manifest number generated",
+      manifest: allocated,
+    });
+  } catch (err) {
+    console.error("Generate manifest number error:", err);
+    return res.status(500).json({ ok: false, message: "Failed to generate manifest number" });
+  }
+});
+
+app.post("/api/manifests", async (req, res) => {
+  try {
+    const docIds = Array.isArray(req.body?.docIds)
+      ? req.body.docIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
+      : [];
+    const manifestNumber = String(req.body?.manifestNumber || "").trim();
+    const toName = String(req.body?.toName || "").trim();
+    const destination = String(req.body?.destination || "").trim();
+    const manifestDate = String(req.body?.manifestDate || "").trim();
+    const through = String(req.body?.through || "").trim();
+
+    if (!docIds.length) {
+      return res.status(400).json({ ok: false, message: "Select at least one order" });
+    }
+
+    if (!/^\d{4,}$/.test(manifestNumber)) {
+      return res.status(400).json({ ok: false, message: "Manifest number must be numeric" });
+    }
+
+    if (!destination) {
+      return res.status(400).json({ ok: false, message: "Destination is required" });
+    }
+
+    if (!manifestDate || Number.isNaN(Date.parse(manifestDate))) {
+      return res.status(400).json({ ok: false, message: "Valid manifest date is required" });
+    }
+
+    const placeholders = docIds.map(() => "?").join(", ");
+    const [rows] = await pool.query(
+      `SELECT id
+       FROM employee_docs
+       WHERE id IN (${placeholders})
+         AND order_status = 'processing'
+         AND (manifest_number IS NULL OR manifest_number = '')`,
+      docIds
+    );
+
+    if (rows.length !== docIds.length) {
+      return res.status(400).json({
+        ok: false,
+        message: "Selected orders must exist in processing and should not already be part of a manifest",
+      });
+    }
+
+    const [duplicate] = await pool.query(
+      `SELECT id
+       FROM employee_docs
+       WHERE manifest_number = ?
+       LIMIT 1`,
+      [manifestNumber]
+    );
+    if (duplicate.length) {
+      return res.status(409).json({ ok: false, message: "Manifest number already exists" });
+    }
+
+    await pool.query(
+      `UPDATE employee_docs
+       SET order_status = 'in_transit',
+           manifest_number = ?,
+           manifest_to_name = ?,
+           manifest_destination = ?,
+           manifest_date = ?,
+           manifest_through = ?
+       WHERE id IN (${placeholders})`,
+      [manifestNumber, toName || null, destination, manifestDate, through || null, ...docIds]
+    );
+
+    return res.json({
+      ok: true,
+      message: "Manifest created successfully",
+      manifest: {
+        manifestNumber,
+        toName,
+        destination,
+        manifestDate,
+        through,
+        docIds,
+        orderStatus: "in_transit",
+      },
+    });
+  } catch (err) {
+    console.error("Create manifest error:", err);
+    return res.status(500).json({ ok: false, message: "Failed to create manifest" });
+  }
+});
+
+app.put("/api/manifests/:manifestNumber", async (req, res) => {
+  try {
+    const manifestNumber = String(req.params?.manifestNumber || "").trim();
+    const toName = String(req.body?.toName || "").trim();
+    const destination = String(req.body?.destination || "").trim();
+    const manifestDate = String(req.body?.manifestDate || "").trim();
+    const through = String(req.body?.through || "").trim();
+    const keepDocIds = Array.isArray(req.body?.keepDocIds)
+      ? req.body.keepDocIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
+      : null;
+    const addDocIds = Array.isArray(req.body?.addDocIds)
+      ? req.body.addDocIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
+      : [];
+
+    if (!manifestNumber) {
+      return res.status(400).json({ ok: false, message: "Manifest number is required" });
+    }
+
+    if (!destination) {
+      return res.status(400).json({ ok: false, message: "Destination is required" });
+    }
+
+    if (!manifestDate || Number.isNaN(Date.parse(manifestDate))) {
+      return res.status(400).json({ ok: false, message: "Valid manifest date is required" });
+    }
+
+    const [existingRows] = await pool.query(
+      `SELECT id
+       FROM employee_docs
+       WHERE manifest_number = ?`,
+      [manifestNumber]
+    );
+
+    if (!existingRows.length) {
+      return res.status(404).json({ ok: false, message: "Manifest not found" });
+    }
+
+    if (keepDocIds && !keepDocIds.length) {
+      return res.status(400).json({ ok: false, message: "Manifest must keep at least one order" });
+    }
+
+    if (keepDocIds) {
+      const existingIds = existingRows.map((row) => Number(row.id));
+      const invalidIds = keepDocIds.filter((id) => !existingIds.includes(id));
+      if (invalidIds.length) {
+        return res.status(400).json({ ok: false, message: "Some selected orders do not belong to this manifest" });
+      }
+
+      const placeholders = keepDocIds.map(() => "?").join(", ");
+      await pool.query(
+        `UPDATE employee_docs
+         SET manifest_number = NULL,
+             manifest_to_name = NULL,
+             manifest_destination = NULL,
+             manifest_date = NULL,
+             manifest_through = NULL,
+             order_status = 'processing'
+         WHERE manifest_number = ?
+           AND id NOT IN (${placeholders})`,
+        [manifestNumber, ...keepDocIds]
+      );
+    }
+
+    if (addDocIds.length) {
+      const addPlaceholders = addDocIds.map(() => "?").join(", ");
+      const [addRows] = await pool.query(
+        `SELECT id
+         FROM employee_docs
+         WHERE id IN (${addPlaceholders})
+           AND order_status = 'processing'
+           AND (manifest_number IS NULL OR manifest_number = '')`,
+        addDocIds
+      );
+
+      if (addRows.length !== addDocIds.length) {
+        return res.status(400).json({
+          ok: false,
+          message: "Added orders must be in processing and should not already belong to another manifest",
+        });
+      }
+
+      await pool.query(
+        `UPDATE employee_docs
+         SET manifest_number = ?,
+             manifest_to_name = ?,
+             manifest_destination = ?,
+             manifest_date = ?,
+             manifest_through = ?,
+             order_status = 'in_transit'
+         WHERE id IN (${addPlaceholders})`,
+        [manifestNumber, toName || null, destination, manifestDate, through || null, ...addDocIds]
+      );
+    }
+
+    const [result] = await pool.query(
+      `UPDATE employee_docs
+       SET manifest_to_name = ?,
+           manifest_destination = ?,
+           manifest_date = ?,
+           manifest_through = ?,
+           order_status = 'in_transit'
+       WHERE manifest_number = ?`,
+      [toName || null, destination, manifestDate, through || null, manifestNumber]
+    );
+
+    if (!result?.affectedRows) {
+      return res.status(404).json({ ok: false, message: "Manifest not found" });
+    }
+
+    return res.json({
+      ok: true,
+      message: "Manifest updated successfully",
+      manifest: {
+        manifestNumber,
+        toName,
+        destination,
+        manifestDate,
+        through,
+      },
+    });
+  } catch (err) {
+    console.error("Update manifest error:", err);
+    return res.status(500).json({ ok: false, message: "Failed to update manifest" });
+  }
+});
+
+app.delete("/api/manifests/:manifestNumber", async (req, res) => {
+  try {
+    const manifestNumber = String(req.params?.manifestNumber || "").trim();
+    if (!manifestNumber) {
+      return res.status(400).json({ ok: false, message: "Manifest number is required" });
+    }
+
+    const [result] = await pool.query(
+      `UPDATE employee_docs
+       SET manifest_number = NULL,
+           manifest_to_name = NULL,
+           manifest_destination = NULL,
+           manifest_date = NULL,
+           manifest_through = NULL,
+           order_status = 'processing'
+       WHERE manifest_number = ?`,
+      [manifestNumber]
+    );
+
+    if (!result?.affectedRows) {
+      return res.status(404).json({ ok: false, message: "Manifest not found" });
+    }
+
+    return res.json({ ok: true, message: "Manifest deleted successfully", manifestNumber });
+  } catch (err) {
+    console.error("Delete manifest error:", err);
+    return res.status(500).json({ ok: false, message: "Failed to delete manifest" });
+  }
+});
+
 app.post("/api/docs", async (req, res) => {
   try {
     const employeeIdInput = req.body?.employeeId;
@@ -2950,6 +3254,7 @@ app.get("/api/orders", async (_req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT d.id, d.employee_id, d.awb_no, d.form_type, d.order_status, d.created_at, d.pdf_link, d.form_data,
+              d.manifest_number, d.manifest_to_name, d.manifest_destination, d.manifest_date, d.manifest_through,
               d.last_scan_latitude, d.last_scan_longitude, d.last_scan_ip, d.last_scan_at,
               d.generated_by_type, d.generated_by_company_id, d.generated_by_company_name, d.generated_by_admin_name,
               e.name AS generated_by_name,
@@ -3001,6 +3306,11 @@ app.get("/api/orders", async (_req, res) => {
         box_count: boxCount || "N/A",
         total_weight: totalWeight || "N/A",
         weight_summary: weightSummary || "N/A",
+        manifest_number: row.manifest_number || "",
+        manifest_to_name: row.manifest_to_name || "",
+        manifest_destination: row.manifest_destination || "",
+        manifest_date: row.manifest_date || null,
+        manifest_through: row.manifest_through || "",
         last_scan_latitude: row.last_scan_latitude,
         last_scan_longitude: row.last_scan_longitude,
         last_scan_ip: row.last_scan_ip || "",
@@ -3063,6 +3373,7 @@ app.post("/api/orders/scan", async (req, res) => {
   try {
     const docId = Number(req.body?.docId || 0);
     const awbNo = String(req.body?.awbNo || "").trim();
+    const manifestNumber = String(req.body?.manifestNumber || "").trim();
     const normalizedAwb = awbNo.replace(/\s+/g, "").toUpperCase();
     const latitudeRaw = req.body?.latitude;
     const longitudeRaw = req.body?.longitude;
@@ -3075,18 +3386,56 @@ app.post("/api/orders/scan", async (req, res) => {
         ? null
         : Number(longitudeRaw);
 
-    if (!awbNo) {
-      return res.status(400).json({ ok: false, message: "awbNo is required" });
+    if (!awbNo && !manifestNumber) {
+      return res.status(400).json({ ok: false, message: "awbNo or manifestNumber is required" });
     }
 
     if ((latitude !== null && Number.isNaN(latitude)) || (longitude !== null && Number.isNaN(longitude))) {
       return res.status(400).json({ ok: false, message: "Invalid latitude or longitude" });
     }
 
+    const clientIp = readClientIp(req);
+    if (manifestNumber) {
+      const [manifestRows] = await pool.query(
+        `SELECT id
+         FROM employee_docs
+         WHERE manifest_number = ?`,
+        [manifestNumber]
+      );
+
+      if (!manifestRows.length) {
+        return res.status(404).json({ ok: false, message: "Manifest not found" });
+      }
+
+      await pool.query(
+        `UPDATE employee_docs
+         SET order_status = 'in_transit',
+             last_scan_latitude = ?,
+             last_scan_longitude = ?,
+             last_scan_ip = ?,
+             last_scan_at = CURRENT_TIMESTAMP
+         WHERE manifest_number = ?`,
+        [latitude, longitude, clientIp || null, manifestNumber]
+      );
+
+      return res.json({
+        ok: true,
+        message: "Manifest orders updated",
+        manifest: {
+          manifestNumber,
+          totalOrders: manifestRows.length,
+          order_status: "in_transit",
+          last_scan_latitude: latitude,
+          last_scan_longitude: longitude,
+          last_scan_ip: clientIp || "",
+        },
+      });
+    }
+
     let rows = [];
     if (docId) {
       const [rowsByIdAndAwb] = await pool.query(
-        `SELECT id, awb_no
+        `SELECT id, awb_no, manifest_number, order_status
          FROM employee_docs
          WHERE id = ? AND REPLACE(UPPER(TRIM(awb_no)), ' ', '') = ?
          LIMIT 1`,
@@ -3097,7 +3446,7 @@ app.post("/api/orders/scan", async (req, res) => {
 
     if (!rows.length) {
       const [rowsByAwb] = await pool.query(
-        `SELECT id, awb_no
+        `SELECT id, awb_no, manifest_number, order_status
          FROM employee_docs
          WHERE REPLACE(UPPER(TRIM(awb_no)), ' ', '') = ?
          ORDER BY id DESC
@@ -3111,8 +3460,17 @@ app.post("/api/orders/scan", async (req, res) => {
       return res.status(404).json({ ok: false, message: "Order not found" });
     }
 
-    const clientIp = readClientIp(req);
-    const matchedDocId = Number(rows[0].id);
+    const matchedDoc = rows[0];
+    const hasManifest = String(matchedDoc.manifest_number || "").trim();
+    const currentStatus = String(matchedDoc.order_status || "").trim().toLowerCase();
+    if (!hasManifest && !["in_transit", "out_for_delivery", "delivered"].includes(currentStatus)) {
+      return res.status(400).json({
+        ok: false,
+        message: "Is order ka manifest abhi create nahi hua hai",
+      });
+    }
+
+    const matchedDocId = Number(matchedDoc.id);
     await pool.query(
       `UPDATE employee_docs
        SET order_status = 'in_transit',
